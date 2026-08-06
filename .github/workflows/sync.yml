@@ -1,8 +1,6 @@
 name: AUR sync check
 
 on:
-  push:
-    branches: [master]
   schedule:
     # Cheap poll (git ls-remote only) every 30 min. No build work happens
     # unless upstream HEAD actually moved — see the cache-gate step below.
