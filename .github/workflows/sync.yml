@@ -40,7 +40,9 @@ jobs:
       - name: Build-check + regen .SRCINFO in Arch container
         if: steps.gate.outputs.cache-hit != 'true'
         run: |
-          docker run --rm -v "$PWD:/work" -w /work archlinux:latest bash -c '
+          HOST_UID=$(id -u)
+          HOST_GID=$(id -g)
+          docker run --rm -v "$PWD:/work" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
             set -e
             pacman -Sy --noconfirm --needed base-devel git sudo \
               qt6-base qt6-declarative qt6-svg qt6-multimedia ffmpeg sdl2 sdl2_ttf \
@@ -50,12 +52,18 @@ jobs:
             chown -R builder:builder /work
             su builder -c "cd /work && makepkg -s --noconfirm --skippgpcheck"
             su builder -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
+            su builder -c "cd /work && rm -rf src pkg *.pkg.tar.zst *.pkg.tar.zst.sig" || true
+            # Undo the chown above — /work is the runner'"'"'s git checkout, and
+            # leaving it owned by the in-container builder UID breaks every
+            # git command the job runs after this step (permission denied on
+            # .git/config since the runner user no longer owns it).
+            chown -R "$HOST_UID:$HOST_GID" /work
           '
 
       - name: Read resolved pkgver
         if: steps.gate.outputs.cache-hit != 'true'
         id: pkgver
-        run: echo "ver=$(grep -m1 '^pkgver = ' .SRCINFO | cut -d' ' -f3)" >> "$GITHUB_OUTPUT"
+        run: echo "ver=$(grep -m1 'pkgver = ' .SRCINFO | awk -F' = ' '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Commit refreshed .SRCINFO to this repo
         if: steps.gate.outputs.cache-hit != 'true'
