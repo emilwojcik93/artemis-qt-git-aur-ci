@@ -1,0 +1,91 @@
+name: AUR sync check
+
+on:
+  schedule:
+    # Cheap poll (git ls-remote only) every 30 min. No build work happens
+    # unless upstream HEAD actually moved — see the cache-gate step below.
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          SHA=$(git ls-remote https://github.com/wjbeckett/artemis.git refs/heads/develop | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # Cache hit == we've already processed this exact upstream SHA.
+      # No hit == new commits landed, worth spending a container build on it.
+      - name: Gate on known SHA
+        id: gate
+        uses: actions/cache@v4
+        with:
+          path: .state/seen
+          key: seen-${{ steps.upstream.outputs.sha }}
+
+      - name: Mark SHA as seen
+        if: steps.gate.outputs.cache-hit != 'true'
+        run: mkdir -p .state && echo "${{ steps.upstream.outputs.sha }}" > .state/seen
+
+      - name: Build-check + regen .SRCINFO in Arch container
+        if: steps.gate.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work archlinux:latest bash -c '
+            set -e
+            pacman -Sy --noconfirm --needed base-devel git sudo \
+              qt6-base qt6-declarative qt6-svg qt6-multimedia ffmpeg sdl2 sdl2_ttf \
+              opus openssl libva libvdpau libplacebo libxkbcommon hicolor-icon-theme \
+              vulkan-headers wayland-protocols qt6-tools
+            useradd -m builder
+            chown -R builder:builder /work
+            su builder -c "cd /work && makepkg -s --noconfirm --skippgpcheck"
+            su builder -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
+          '
+
+      - name: Read resolved pkgver
+        if: steps.gate.outputs.cache-hit != 'true'
+        id: pkgver
+        run: echo "ver=$(grep -m1 '^pkgver = ' .SRCINFO | cut -d' ' -f3)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit refreshed .SRCINFO to this repo
+        if: steps.gate.outputs.cache-hit != 'true'
+        run: |
+          git config user.name "artemis-qt-git-aur-ci"
+          git config user.email "actions@users.noreply.github.com"
+          git add .SRCINFO
+          git diff --cached --quiet || git commit -m "sync: pkgver ${{ steps.pkgver.outputs.ver }} (upstream ${{ steps.upstream.outputs.sha }})"
+          git push
+
+      - name: Push to AUR
+        if: steps.gate.outputs.cache-hit != 'true'
+        env:
+          SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/aur_ed25519
+          chmod 600 ~/.ssh/aur_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/artemis-qt-git.git aur-repo
+          cp PKGBUILD .SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "Emilwojcik93"
+          git config user.email "emilwojcik93@gmail.com"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && echo "No AUR-visible change, skipping push." || {
+            git commit -m "CI: sync pkgver ${{ steps.pkgver.outputs.ver }} (upstream ${{ steps.upstream.outputs.sha }})"
+            git push
+          }
+
+      - name: Note build failure
+        if: failure()
+        run: |
+          echo "::error::Build check failed against upstream ${{ steps.upstream.outputs.sha }} — PKGBUILD likely needs a manual fix (new dep, build-system change). Nothing was pushed to AUR."
