@@ -42,6 +42,8 @@ jobs:
         run: |
           HOST_UID=$(id -u)
           HOST_GID=$(id -g)
+          mkdir -p logs
+          set -o pipefail
           docker run --rm -v "$PWD:/work" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
             set -e
             pacman -Sy --noconfirm --needed base-devel git sudo \
@@ -50,15 +52,39 @@ jobs:
               vulkan-headers wayland-protocols qt6-tools
             useradd -m builder
             chown -R builder:builder /work
-            su builder -c "cd /work && makepkg -s --noconfirm --skippgpcheck"
+            su builder -c "cd /work && makepkg -s --noconfirm --skippgpcheck --log"
             su builder -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
+            su builder -c "cd /work && mv -f *-build.log logs/build.log 2>/dev/null || true"
             su builder -c "cd /work && rm -rf src pkg *.pkg.tar.zst *.pkg.tar.zst.sig" || true
             # Undo the chown above — /work is the runner'"'"'s git checkout, and
             # leaving it owned by the in-container builder UID breaks every
             # git command the job runs after this step (permission denied on
             # .git/config since the runner user no longer owns it).
             chown -R "$HOST_UID:$HOST_GID" /work
-          '
+          ' 2>&1 | tee logs/full-container-output.log
+
+      - name: Extract compiler warnings summary
+        if: steps.gate.outputs.cache-hit != 'true'
+        run: |
+          grep -E ': warning: ' logs/full-container-output.log | sort -u > logs/warnings-summary.log || true
+          echo "warning_count=$(wc -l < logs/warnings-summary.log)" >> "$GITHUB_ENV"
+          echo "### Compiler warnings: $(wc -l < logs/warnings-summary.log)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s logs/warnings-summary.log ]; then
+            { echo '```'; cat logs/warnings-summary.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload build logs
+        if: always() && steps.gate.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            logs/full-container-output.log
+            logs/build.log
+            logs/warnings-summary.log
+            .SRCINFO
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Read resolved pkgver
         if: steps.gate.outputs.cache-hit != 'true'
