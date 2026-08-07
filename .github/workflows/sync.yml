@@ -4,7 +4,11 @@ on:
   schedule:
     # Cheap poll (git ls-remote only) every 30 min. No build work happens
     # unless upstream HEAD actually moved — see the cache-gate step below.
-    - cron: '*/30 * * * *'
+    # Offset off :00/:30 on purpose — GitHub's own docs flag the top of
+    # every hour (and half-hour) as high-load times where scheduled runs
+    # get delayed or silently dropped. Observed zero scheduled firings in
+    # 11.5h at '*/30 * * * *' before this change.
+    - cron: '7,37 * * * *'
   workflow_dispatch: {}
 
 permissions:
