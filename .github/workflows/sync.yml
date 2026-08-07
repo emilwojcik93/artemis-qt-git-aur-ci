@@ -1,15 +1,18 @@
 name: AUR sync check
 
 on:
-  schedule:
-    # Cheap poll (git ls-remote only) every 30 min. No build work happens
-    # unless upstream HEAD actually moved — see the cache-gate step below.
-    # Offset off :00/:30 on purpose — GitHub's own docs flag the top of
-    # every hour (and half-hour) as high-load times where scheduled runs
-    # get delayed or silently dropped. Observed zero scheduled firings in
-    # 11.5h at '*/30 * * * *' before this change.
-    - cron: '7,37 * * * *'
   workflow_dispatch: {}
+  # Schedule intentionally disabled — AUR's own git/ssh backend has been in
+  # an extended outage since ~2026-08-04 (community-reported, see repo
+  # README), so a cron trigger just piles up failed runs against an
+  # external problem we can't fix. Re-enable once AUR is confirmed stable:
+  #
+  # schedule:
+  #   # Offset off :00/:30 on purpose — GitHub's docs flag the top of every
+  #   # hour (and half-hour) as high-load times where scheduled runs get
+  #   # delayed or silently dropped; observed zero firings in 11.5h at
+  #   # '*/30 * * * *' before switching to this offset.
+  #   - cron: '7,37 * * * *'
 
 permissions:
   contents: write
@@ -26,18 +29,18 @@ jobs:
           SHA=$(git ls-remote https://github.com/wjbeckett/artemis.git refs/heads/develop | cut -f1)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      # Cache hit == we've already processed this exact upstream SHA.
-      # No hit == new commits landed, worth spending a container build on it.
+      # Restore-only. Whether this SHA gets marked "seen" is decided at the
+      # END of the job (see "Mark SHA as fully synced") and only if the
+      # whole pipeline — build AND the AUR push — actually succeeded.
+      # Marking it seen up front would let a genuinely broken SHA get
+      # cached as done after just the build step, silently skipping retries
+      # forever even though nothing was ever pushed.
       - name: Gate on known SHA
         id: gate
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .state/seen
           key: seen-${{ steps.upstream.outputs.sha }}
-
-      - name: Mark SHA as seen
-        if: steps.gate.outputs.cache-hit != 'true'
-        run: mkdir -p .state && echo "${{ steps.upstream.outputs.sha }}" > .state/seen
 
       - name: Build-check + regen .SRCINFO in Arch container
         if: steps.gate.outputs.cache-hit != 'true'
@@ -69,7 +72,6 @@ jobs:
         if: steps.gate.outputs.cache-hit != 'true'
         run: |
           grep -E ': warning: ' logs/full-container-output.log | sort -u > logs/warnings-summary.log || true
-          echo "warning_count=$(wc -l < logs/warnings-summary.log)" >> "$GITHUB_ENV"
           echo "### Compiler warnings: $(wc -l < logs/warnings-summary.log)" >> "$GITHUB_STEP_SUMMARY"
           if [ -s logs/warnings-summary.log ]; then
             { echo '```'; cat logs/warnings-summary.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -104,6 +106,7 @@ jobs:
 
       - name: Push to AUR
         if: steps.gate.outputs.cache-hit != 'true'
+        id: aur_push
         env:
           SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
@@ -111,8 +114,25 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/aur_ed25519
           chmod 600 ~/.ssh/aur_ed25519
           ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes"
-          git clone ssh://aur@aur.archlinux.org/artemis-qt-git.git aur-repo
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o ConnectTimeout=15"
+
+          # AUR's git/ssh backend has known transient blips (distinct from
+          # the extended outage this repo was built during) — a handful of
+          # short retries covers those without needing a manual re-run for
+          # every flake, while still failing fast on a real, sustained
+          # outage instead of hanging the job.
+          attempt=0
+          until git clone ssh://aur@aur.archlinux.org/artemis-qt-git.git aur-repo 2>clone.err; do
+            attempt=$((attempt+1))
+            cat clone.err >&2
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::AUR clone failed after 3 attempts — likely an AUR-side outage, not a pipeline bug. See clone.err above."
+              exit 1
+            fi
+            echo "Clone attempt $attempt failed, retrying in 20s..."
+            sleep 20
+          done
+
           cp PKGBUILD .SRCINFO aur-repo/
           cd aur-repo
           git config user.name "Emilwojcik93"
@@ -123,7 +143,26 @@ jobs:
             git push
           }
 
-      - name: Note build failure
+      # Only reached if build-check AND the AUR push both succeeded (or the
+      # gate already skipped because this SHA was previously fully synced).
+      # This is what actually marks the SHA done — see the comment on
+      # "Gate on known SHA" for why that matters.
+      - name: Mark SHA as fully synced
+        if: steps.gate.outputs.cache-hit != 'true' && success()
+        run: mkdir -p .state && echo "${{ steps.upstream.outputs.sha }}" > .state/seen
+
+      - name: Save sync-complete cache
+        if: steps.gate.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/seen
+          key: seen-${{ steps.upstream.outputs.sha }}
+
+      - name: Note failure reason
         if: failure()
         run: |
-          echo "::error::Build check failed against upstream ${{ steps.upstream.outputs.sha }} — PKGBUILD likely needs a manual fix (new dep, build-system change). Nothing was pushed to AUR."
+          if [ "${{ steps.aur_push.outcome }}" = "failure" ]; then
+            echo "::error::AUR push failed against upstream ${{ steps.upstream.outputs.sha }} — build itself succeeded, this looks like an AUR-side (git/ssh backend) problem, not a PKGBUILD issue. This SHA was NOT marked as synced, so it will be retried on the next manual run."
+          else
+            echo "::error::Build check failed against upstream ${{ steps.upstream.outputs.sha }} — PKGBUILD likely needs a manual fix (new dep, build-system change). Nothing was pushed to AUR."
+          fi

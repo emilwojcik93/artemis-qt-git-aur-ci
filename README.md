@@ -5,26 +5,38 @@ AUR package (tracks [wjbeckett/artemis](https://github.com/wjbeckett/artemis) `d
 
 ## What it does
 
-`.github/workflows/sync.yml` runs every 30 min:
+`.github/workflows/sync.yml` is **manual-trigger only right now**
+(`workflow_dispatch`) — the `schedule:` cron is commented out in the file,
+not deleted. It was disabled because AUR's own git/ssh backend has been in
+an extended outage since ~2026-08-04 (community-reported: [Arch Forums
+thread](https://bbs.archlinux.org/viewtopic.php?pid=2306340#p2306340),
+[StatusGator](https://statusgator.com/services/arch-linux/aur)), and a
+30-min cron just piles up failed runs against a problem this repo can't
+fix. Re-enable the cron block once AUR is confirmed stable again.
+
+Run (manually, via Actions tab → "Run workflow"):
 
 1. `git ls-remote` the upstream `develop` branch (cheap, no build cost).
-2. If the SHA hasn't been seen before (cache-gated), spins up an `archlinux`
-   container and runs `makepkg -s` against the current `PKGBUILD` — a real
-   build-health check, not just a version bump.
-3. On success: regenerates `.SRCINFO`, commits it here, then pushes
-   `PKGBUILD` + `.SRCINFO` to the AUR git repo.
-4. On failure: the workflow run fails with an annotation — GitHub emails
-   the repo owner automatically. Nothing gets pushed to AUR on a broken
-   build. **Dependency/build-step fixes still need a human PKGBUILD edit**;
-   this only catches breakage early and auto-syncs the trivial case
-   (upstream commit moved, build still works).
+2. If the SHA hasn't been fully synced before (cache-gated — see below),
+   spins up an `archlinux` container and runs `makepkg -s` against the
+   current `PKGBUILD` — a real build-health check, not just a version bump.
+3. On build success: regenerates `.SRCINFO`, commits it here, then pushes
+   `PKGBUILD` + `.SRCINFO` to the AUR git repo (with a few short retries for
+   transient AUR blips — distinct from a sustained outage, which still
+   fails the run after 3 tries rather than hanging).
+4. The SHA is only marked "seen" (cache key `seen-<sha>`) **after both the
+   build and the AUR push succeed** — a SHA that fails partway is retried
+   on the next run, not silently skipped forever.
+5. On failure: the workflow run fails with an annotation that distinguishes
+   "build itself broke" (PKGBUILD needs a human fix) from "build succeeded,
+   AUR push failed" (external AUR problem, safe to just re-run later).
+   GitHub emails the repo owner automatically either way.
 
 This is upstream-owned-repo-friendly: it doesn't require write/webhook
 access to `wjbeckett/artemis`, only public read access via `git ls-remote`.
 True push-triggered (zero-poll) sync isn't possible without upstream adding
 a webhook to *this* repo, which is out of our control — see conversation
-notes. 30 min polling of `ls-remote` is effectively free (no clone, no
-build) so this is the practical ceiling.
+notes.
 
 ## One-time setup (manual, by design)
 
@@ -43,8 +55,8 @@ personal AUR SSH key). Add its **public** half to your AUR account:
 
 The private half is already stored as the encrypted, masked repo secret
 `AUR_SSH_PRIVATE_KEY` (Settings → Secrets and variables → Actions). Nothing
-further to do — once the public key is on your AUR account, the next
-scheduled run (or a manual "Run workflow" dispatch) will push successfully.
+further to do — once the public key is on your AUR account, a manual "Run
+workflow" dispatch will push successfully (assuming AUR itself is up).
 
 ## Key rotation
 
@@ -55,5 +67,8 @@ the `AUR_SSH_PRIVATE_KEY` secret to fully retire it).
 
 ## Manual trigger
 
-Actions tab → "AUR sync check" → "Run workflow" — bypasses the 30 min
-wait, useful right after adding the pubkey to confirm it works end to end.
+Actions tab → "AUR sync check" → "Run workflow". This is currently the
+*only* way this workflow runs (see "What it does" above) — check
+[aur.archlinux.org](https://aur.archlinux.org/) is actually reachable
+before dispatching if a previous run failed with "The AUR is down due to
+maintenance".
