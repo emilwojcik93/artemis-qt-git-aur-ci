@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write  # needed to prune old ccache-* cache entries (gh cache delete)
 
 jobs:
   check-and-sync:
@@ -100,6 +101,18 @@ jobs:
           path: ci-ccache
           key: ccache-${{ github.run_id }}
 
+      # actions/cache keys are immutable (can't overwrite ccache-<run_id>),
+      # so every run leaves its own cache entry behind forever otherwise —
+      # bounded only by GitHub's 10GB-per-repo/7-day-unused eviction, but
+      # pure waste until then. Keep just the one just-saved above.
+      - name: Prune older ccache cache entries
+        if: steps.gate.outputs.cache-hit != 'true' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --key ccache- --json id,key -q '.[] | select(.key != "ccache-${{ github.run_id }}") | .id' \
+            | xargs -r -n1 gh cache delete || true
+
       - name: Extract compiler warnings summary
         if: steps.gate.outputs.cache-hit != 'true'
         run: |
@@ -145,8 +158,16 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/aur_ed25519
           chmod 600 ~/.ssh/aur_ed25519
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o ConnectTimeout=15"
+          # Pinned, not blind ssh-keyscan: this is AUR's actual published
+          # ED25519 host key (SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4,
+          # matches https://archlinux.org/news/aur-migration-new-ssh-hostkeys/,
+          # verified 2026-08-27). Blind ssh-keyscan trusts whatever key the
+          # network hands back on first connect (TOFU) — fine for a human
+          # doing it once interactively, not great for an unattended runner
+          # that reconnects fresh every single run with no memory of the
+          # last one it saw.
+          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN" >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes"
 
           # AUR's git/ssh backend has known transient blips (distinct from
           # the extended outage this repo was built during) — a handful of
@@ -195,6 +216,13 @@ jobs:
         run: |
           if [ "${{ steps.aur_push.outcome }}" = "failure" ]; then
             echo "::error::AUR push failed against upstream ${{ steps.upstream.outputs.sha }} — build itself succeeded, this looks like an AUR-side (git/ssh backend) problem, not a PKGBUILD issue. This SHA was NOT marked as synced, so it will be retried on the next manual run."
+          # Distinguish a transient Arch mirror/network hiccup during the
+          # container's `pacman -Sy` from an actual PKGBUILD/build-system
+          # break — both fail the same step, but only one needs a human
+          # to touch the PKGBUILD. Grep the raw container log for pacman's
+          # own failure signatures rather than guessing from the exit code.
+          elif [ -f logs/full-container-output.log ] && grep -qE "failed to synchronize|error: failed retrieving file|could not resolve host|error: failed to commit transaction \(conflicting files\)" logs/full-container-output.log; then
+            echo "::error::Build-check container failed to install its own dependencies (Arch mirror/network hiccup during pacman -Sy) against upstream ${{ steps.upstream.outputs.sha }} — this is not a PKGBUILD problem. Nothing was pushed to AUR; safe to just re-run."
           else
             echo "::error::Build check failed against upstream ${{ steps.upstream.outputs.sha }} — PKGBUILD likely needs a manual fix (new dep, build-system change). Nothing was pushed to AUR."
           fi
