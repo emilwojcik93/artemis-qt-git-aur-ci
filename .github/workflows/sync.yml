@@ -41,22 +41,43 @@ jobs:
           path: .state/seen
           key: seen-${{ steps.upstream.outputs.sha }}
 
+      # ccache dir lives on the host (outside /work, which is the checkout)
+      # so it survives across runs via actions/cache, keyed loosely since
+      # content shifts per upstream commit but most submodule code doesn't.
+      - name: Restore ccache
+        if: steps.gate.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
       - name: Build-check + regen .SRCINFO in Arch container
         if: steps.gate.outputs.cache-hit != 'true'
         run: |
           HOST_UID=$(id -u)
           HOST_GID=$(id -g)
-          mkdir -p logs
+          mkdir -p logs ci-ccache
           set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
+          # NOTE (2026-08-27): this container is a fresh archlinux:latest
+          # every run — its /etc/makepkg.conf is completely stock, so
+          # MAKEFLAGS is unset there regardless of what the host's
+          # makepkg.conf says. A prior run measured this actually building
+          # serially (4m07s compile, single core) despite the runner having
+          # multiple vCPUs. Fixed by exporting MAKEFLAGS explicitly here.
+          # ccache is wired the same way host builds use it: its shim dir
+          # goes first on PATH so `gcc`/`g++` resolve to the cached wrapper.
+          docker run --rm -v "$PWD:/work" -v "$PWD/ci-ccache:/ccache" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
             set -e
-            pacman -Sy --noconfirm --needed base-devel git sudo \
+            pacman -Sy --noconfirm --needed base-devel git sudo ccache \
               qt6-base qt6-declarative qt6-svg qt6-multimedia ffmpeg sdl2 sdl2_ttf \
               opus openssl libva libvdpau libplacebo libxkbcommon hicolor-icon-theme \
               vulkan-headers wayland-protocols qt6-tools
             useradd -m builder
-            chown -R builder:builder /work
-            su builder -c "cd /work && makepkg -s --noconfirm --skippgpcheck --log"
+            chown -R builder:builder /work /ccache
+            BUILD_ENV="MAKEFLAGS=-j$(nproc) CCACHE_DIR=/ccache PATH=/usr/lib/ccache/bin:\$PATH"
+            su builder -c "cd /work && env $BUILD_ENV makepkg -s --noconfirm --skippgpcheck --log"
             su builder -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
             su builder -c "cd /work && mv -f *-build.log logs/build.log 2>/dev/null || true"
             su builder -c "cd /work && rm -rf src pkg *.pkg.tar.zst *.pkg.tar.zst.sig" || true
@@ -64,8 +85,15 @@ jobs:
             # leaving it owned by the in-container builder UID breaks every
             # git command the job runs after this step (permission denied on
             # .git/config since the runner user no longer owns it).
-            chown -R "$HOST_UID:$HOST_GID" /work
+            chown -R "$HOST_UID:$HOST_GID" /work /ccache
           ' 2>&1 | tee logs/full-container-output.log
+
+      - name: Save ccache
+        if: steps.gate.outputs.cache-hit != 'true' && always()
+        uses: actions/cache/save@v4
+        with:
+          path: ci-ccache
+          key: ccache-${{ github.run_id }}
 
       - name: Extract compiler warnings summary
         if: steps.gate.outputs.cache-hit != 'true'
