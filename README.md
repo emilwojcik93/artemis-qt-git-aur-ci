@@ -92,6 +92,42 @@ Ran a real dispatch after the AUR outage cleared:
 - No secrets found in the uploaded container/build logs (checked for
   private key material, the AUR SSH secret, tokens).
 
+## Build performance (2026-08-27)
+
+Found by inspecting real step timings, not assumed: the build-check
+container is a fresh `archlinux:latest` every run with a stock, untouched
+`/etc/makepkg.conf` — `MAKEFLAGS` was never set there, so it was compiling
+**serially** on a multi-vCPU runner (measured 4m07s compile phase). Fixed
+by exporting `MAKEFLAGS=-j$(nproc)` for the `makepkg` invocation and wiring
+up `ccache` with its dir persisted across runs via `actions/cache`.
+
+Measured impact, run-by-run (`Build-check` step wall time):
+
+| Run | State | Time |
+|---|---|---|
+| before this fix | no `MAKEFLAGS`, no ccache | 277s |
+| after fix, 1st run | `-j$(nproc)`, **cold** ccache | 308s (slightly worse — hashing overhead, zero hit rate on a first run) |
+| after fix, 2nd run | `-j$(nproc)`, **warm** ccache | **129s (53% faster than baseline)** |
+
+The cold-run regression is expected and matches the same pattern found
+testing the local host's ccache setup last session (cold cache ≈ baseline,
+the win only shows up warm) — reported here instead of only reporting the
+good number, since the first real run genuinely was slower. With the
+schedule running every ~30 min, only the very first run after a cache
+eviction pays the cold tax; steady-state runs should land near the 129s
+figure. All three runs produced the same 8 pre-existing benign warnings
+and zero build errors — the speedup changed nothing about build
+correctness.
+
+Considered and *not* done: a prebuilt CI base image (to skip the ~330MiB
+`pacman -Sy` dependency install every run) — real but smaller win than the
+parallelism fix, and adds a second image-build workflow to maintain;
+static-linking ffmpeg into the package — no codec/compatibility gain
+(system ffmpeg already builds with the full h264/hevc/av1 encode+decode +
+vaapi/vdpau/vulkan/qsv/amf/nvenc/nvdec matrix) for a real cost (bigger
+binary, manual security-update lag, throws away the auto-rebuild-on-ABI-
+bump mechanism that already handles this dynamically).
+
 Also fixed, on the machine running the companion local auto-rebuild
 (pacman hook + systemd service/timer that rebuilds `artemis-qt-git`
 whenever `ffmpeg`/`libplacebo` gets upgraded — separate from this repo's

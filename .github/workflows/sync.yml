@@ -68,6 +68,11 @@ jobs:
           # multiple vCPUs. Fixed by exporting MAKEFLAGS explicitly here.
           # ccache is wired the same way host builds use it: its shim dir
           # goes first on PATH so `gcc`/`g++` resolve to the cached wrapper.
+          # Measured (see README "Build performance"): cold ccache run was
+          # actually a bit SLOWER than the old serial baseline (308s vs
+          # 277s, pure hashing overhead with 0% hit rate) — the win only
+          # shows up warm (129s, 53% faster than baseline). Don't read a
+          # single cold run as this fix failing.
           docker run --rm -v "$PWD:/work" -v "$PWD/ci-ccache:/ccache" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
             set -e
             pacman -Sy --noconfirm --needed base-devel git sudo ccache \
