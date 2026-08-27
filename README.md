@@ -128,6 +128,28 @@ vaapi/vdpau/vulkan/qsv/amf/nvenc/nvdec matrix) for a real cost (bigger
 binary, manual security-update lag, throws away the auto-rebuild-on-ABI-
 bump mechanism that already handles this dynamically).
 
+## Compiler warnings fixed (2026-08-28)
+
+Went through every warning in [run
+33114871984](https://github.com/emilwojcik93/artemis-qt-git-aur-ci/actions/runs/33114871984)
+(the 8 reported in "Verified end-to-end" above) individually — root-caused
+each against the real upstream source and this host's exact package
+versions (qt6-base 6.11.2, gcc 16.2, same as the Arch CI container) before
+patching, not blind-suppressed. All 5 root causes are fixed via `prepare()`
+patches in `PKGBUILD` (upstream `wjbeckett/artemis` isn't ours to push to):
+
+| Warning | Root cause | Fix |
+|---|---|---|
+| `qchar.h:48` SFINAE-incomplete (×7) | Qt6/GCC16 header-order trap: `QSemaphore` pulls in `<unordered_map>` before `QChar` completes. Reproduced standalone, confirmed `#include <QChar>` first clears it. | Insert `#include <QChar>` above `#include <QSemaphore>` in `session.h`. |
+| `masterhook.c`/`masterhook_internal.c`: `_GNU_SOURCE` redefined | Confirmed from the actual `gcc` invocation: qmake's `app.pro` already passes `-D_GNU_SOURCE=1` project-wide. | Guard both files' own `#define` with `#ifndef`. |
+| `computermanager.cpp:782`: unused `otpHash` | Read the full function — genuinely dead (handshake derives its AES key from salt+PIN only). Not a truncated security check. | `Q_UNUSED(otpHash);`. |
+| `path.cpp:35,49`: `[[nodiscard]]` `QFile::open()` ignored | Real latent bug, not just noise — a failed `open()` would silently no-op instead of surfacing. | Check the result, `qWarning()` + early return on failure. |
+| `plvk.cpp:563-564`: `AVVulkanDeviceContext::lock_queue`/`unlock_queue` deprecated | Real fix is `VK_KHR_internally_synchronized_queues` — a genuine Vulkan-sync-model change, not a mechanical patch. Filed as an upstream issue instead of blind-patched. | `#pragma GCC diagnostic ignored "-Wdeprecated-declarations"` around this one already-version-gated legacy call site only. |
+
+Verified with a real full build against these exact patches (not assumed):
+0 errors, 0 warnings, `artemis` binary linked successfully — down from 8
+warnings/0 errors before.
+
 Also fixed, on the machine running the companion local auto-rebuild
 (pacman hook + systemd service/timer that rebuilds `artemis-qt-git`
 whenever `ffmpeg`/`libplacebo` gets upgraded — separate from this repo's
