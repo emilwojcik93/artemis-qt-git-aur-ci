@@ -68,7 +68,7 @@ prepare() {
   #    first does not) against this host's qt6-base 6.11.2 + gcc 16.2 before
   #    trusting the fix — same versions the Arch CI container installs.
   sed -i '0,/^#include <QSemaphore>$/s//#include <QChar>\n#include <QSemaphore>/' \
-    streaming/session.h
+    app/streaming/session.h
 
   # 2. _GNU_SOURCE redefined (masterhook.c, masterhook_internal.c): confirmed
   #    from the actual compiler invocation in the log — qmake's app.pro
@@ -78,23 +78,23 @@ prepare() {
   #    comments re: fcntl.h open() redirection) and must not depend on the
   #    project-wide define being present if built standalone.
   sed -i 's/^#define _GNU_SOURCE$/#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif/' \
-    masterhook.c masterhook_internal.c
+    app/masterhook.c app/masterhook_internal.c
 
   # 3. unused parameter 'otpHash' (backend/computermanager.cpp): confirmed by
   #    reading the full function — it's dead (the handshake derives its AES
   #    key from salt+PIN only, not otpHash), not a truncated security check.
   #    Q_UNUSED documents that rather than silently dropping the parameter.
   sed -i '/bool performFullPairingHandshake(NvHTTP& http, const QString& saltStr, const QString& otpHash, const QString& pin)/{n;a\        Q_UNUSED(otpHash);
-}' backend/computermanager.cpp
+}' app/backend/computermanager.cpp
 
   # 4. [[nodiscard]] QFile::open() ignored (path.cpp x2): not just silencing —
   #    an unchecked open() means readDataFile()/writeCacheFile() would
   #    silently no-op on a permissions/disk-full failure instead of surfacing
   #    it. Check the result and warn.
   perl -0777 -pi -e 's/(QByteArray Path::readDataFile\(QString fileName\)\n\{\n    QFile dataFile\(getDataFilePath\(fileName\)\);\n)    dataFile\.open\(QIODevice::ReadOnly\);\n    return dataFile\.readAll\(\);/${1}    if (!dataFile.open(QIODevice::ReadOnly)) {\n        qWarning() << "Path::readDataFile: failed to open" << dataFile.fileName();\n        return QByteArray();\n    }\n    return dataFile.readAll();/' \
-    path.cpp
+    app/path.cpp
   perl -0777 -pi -e 's/(QFile dataFile\(cacheDir\.absoluteFilePath\(fileName\)\);\n)    dataFile\.open\(QIODevice::WriteOnly\);\n    dataFile\.write\(data\);/${1}    if (!dataFile.open(QIODevice::WriteOnly)) {\n        qWarning() << "Path::writeCacheFile: failed to open" << dataFile.fileName();\n        return;\n    }\n    dataFile.write(data);/' \
-    path.cpp
+    app/path.cpp
 
   # 5. AVVulkanDeviceContext::lock_queue/unlock_queue deprecated (plvk.cpp):
   #    real replacement is VK_KHR_internally_synchronized_queues, a genuine
@@ -104,9 +104,9 @@ prepare() {
   #    Silence just this already version-gated, intentional legacy call site
   #    so the warning doesn't keep drowning out real ones in future logs.
   sed -i 's/^\(\s*\)vkDeviceContext->lock_queue = lockQueue;/\1#pragma GCC diagnostic push\n\1#pragma GCC diagnostic ignored "-Wdeprecated-declarations"\n&/' \
-    streaming/video/ffmpeg-renderers/plvk.cpp
+    app/streaming/video/ffmpeg-renderers/plvk.cpp
   sed -i 's/^\(\s*\)vkDeviceContext->unlock_queue = unlockQueue;/&\n\1#pragma GCC diagnostic pop/' \
-    streaming/video/ffmpeg-renderers/plvk.cpp
+    app/streaming/video/ffmpeg-renderers/plvk.cpp
 }
 
 build() {
