@@ -2,17 +2,16 @@ name: AUR sync check
 
 on:
   workflow_dispatch: {}
-  # Schedule intentionally disabled — AUR's own git/ssh backend has been in
-  # an extended outage since ~2026-08-04 (community-reported, see repo
-  # README), so a cron trigger just piles up failed runs against an
-  # external problem we can't fix. Re-enable once AUR is confirmed stable:
-  #
-  # schedule:
-  #   # Offset off :00/:30 on purpose — GitHub's docs flag the top of every
-  #   # hour (and half-hour) as high-load times where scheduled runs get
-  #   # delayed or silently dropped; observed zero firings in 11.5h at
-  #   # '*/30 * * * *' before switching to this offset.
-  #   - cron: '7,37 * * * *'
+  # Re-enabled 2026-08-27: AUR's git/ssh outage (started ~2026-08-04) is
+  # confirmed over — verified via direct ssh/git ls-remote AND a real
+  # end-to-end dispatched run (build + AUR clone succeeded). Was manual-only
+  # while the outage lasted; see git history for the disable commit.
+  schedule:
+    # Offset off :00/:30 on purpose — GitHub's docs flag the top of every
+    # hour (and half-hour) as high-load times where scheduled runs get
+    # delayed or silently dropped; observed zero firings in 11.5h at
+    # '*/30 * * * *' before switching to this offset.
+    - cron: '7,37 * * * *'
 
 permissions:
   contents: write
