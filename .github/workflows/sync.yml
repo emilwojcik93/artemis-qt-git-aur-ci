@@ -17,9 +17,22 @@ permissions:
   contents: write
   actions: write  # needed to prune old ccache-* cache entries (gh cache delete)
 
+# 2026-09-24: serialize runs so a slow real build (schedule or manual) can't
+# overlap a second dispatch racing the same seen-<sha>/ccache-* cache keys
+# and the same AUR git push. cancel-in-progress=false -- we want the queued
+# run to still happen after the first finishes, not be dropped, since a
+# dropped run could be the one that would've caught a real upstream change.
+concurrency:
+  group: aur-sync
+  cancel-in-progress: false
+
 jobs:
   check-and-sync:
     runs-on: ubuntu-latest
+    # Real builds measure ~2-5min; this is a generous ceiling so a genuine
+    # hang (network stall, container wedged) fails fast instead of idling
+    # up to GitHub's 6h default and burning Actions minutes silently.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -74,9 +87,13 @@ jobs:
           # 277s, pure hashing overhead with 0% hit rate) — the win only
           # shows up warm (129s, 53% faster than baseline). Don't read a
           # single cold run as this fix failing.
-          docker run --rm -v "$PWD:/work" -v "$PWD/ci-ccache:/ccache" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
+          # Wrapped in `timeout` as a hard backstop under the job-level
+          # timeout-minutes -- a wedged container (e.g. a pacman prompt
+          # nothing answers) would otherwise idle until the job-level limit,
+          # this fails it fast with a clear signal in the log.
+          timeout 20m docker run --rm -v "$PWD:/work" -v "$PWD/ci-ccache:/ccache" -w /work -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" archlinux:latest bash -c '
             set -e
-            pacman -Sy --noconfirm --needed base-devel git sudo ccache \
+            pacman -Sy --noconfirm --needed base-devel git sudo ccache namcap curl pacman-contrib \
               qt6-base qt6-declarative qt6-svg qt6-multimedia ffmpeg sdl2 sdl2_ttf \
               opus openssl libva libvdpau libplacebo libxkbcommon hicolor-icon-theme \
               vulkan-headers wayland-protocols qt6-tools
@@ -86,6 +103,75 @@ jobs:
             su builder -c "cd /work && env $BUILD_ENV makepkg -s --noconfirm --skippgpcheck --log"
             su builder -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
             su builder -c "cd /work && mv -f *-build.log logs/build.log 2>/dev/null || true"
+
+            echo "=== pkgver regression guard ==="
+            # Never push a pkgver that is version-OLDER than what is already
+            # live on AUR. Only a real bug would cause this (a `git describe`
+            # oddity upstream, or a logic error here), but a bad push is hard
+            # to undo -- AUR rejects force-pushes/history rewrites once
+            # pushed (hit this once already on this package, see project
+            # notes) -- so check before touching AUR, not after.
+            NEW_VER=$(grep -m1 "pkgver = " /work/.SRCINFO | awk -F" = " "{print \$2}")
+            LIVE_VER=$(curl -fsS "https://aur.archlinux.org/rpc/v5/info?arg[]=artemis-qt-git" \
+              | grep -oE "\"Version\":\"[^\"]*\"" | cut -d\" -f4 | sed "s/-[0-9]*\$//")
+            if [ -z "$LIVE_VER" ]; then
+              echo "::warning::Could not read current AUR version (RPC unreachable or package missing) -- skipping regression check, not blocking."
+            else
+              echo "Live AUR pkgver: $LIVE_VER / New pkgver: $NEW_VER"
+              if ! vercmp "$NEW_VER" "$LIVE_VER" | grep -qE "^(0|1)$"; then
+                echo "::error::New pkgver ($NEW_VER) is OLDER than the live AUR version ($LIVE_VER) per vercmp. Refusing to proceed -- this would look like a downgrade to every AUR user. Investigate before overriding."
+                exit 1
+              fi
+            fi
+
+            # --- Post-build validation (2026-09-24) ---
+            # A build that merely *compiles* can still ship something broken
+            # (missing runtime dep, bad packaging, a binary that crashes on
+            # launch) -- namcap and moonlight-qt/artemis history both show
+            # this: hicolor-icon-theme and the qmake PREFIX bug were only
+            # ever caught by actually building+installing, never by reading
+            # the PKGBUILD. These checks run before AUR ever sees the result.
+            echo "=== namcap: PKGBUILD ===" > /work/logs/namcap.log
+            su builder -c "cd /work && namcap PKGBUILD" >> /work/logs/namcap.log 2>&1 || true
+            echo "=== namcap: built package ===" >> /work/logs/namcap.log
+            su builder -c "cd /work && namcap *.pkg.tar.zst" >> /work/logs/namcap.log 2>&1 || true
+            # namcap warnings are mostly known false positives here (QML
+            # modules, transitive libs already covered -- see project notes)
+            # so it is informational only; only an `E:` (error, not `W:`
+            # warning) from namcap is a real hard blocker.
+            if grep -qE "^\S+ E: " /work/logs/namcap.log; then
+              echo "::error::namcap reported a hard error (E:), see logs/namcap.log"
+              cat /work/logs/namcap.log
+              exit 1
+            fi
+
+            echo "=== round-trip install test (pacman -U) ==="
+            pacman -U --noconfirm /work/*.pkg.tar.zst
+
+            echo "=== ldd check: no missing shared libs ==="
+            # This is the exact failure class that started this whole
+            # project (libavcodec.so.58: cannot open shared object file) --
+            # catch it here, before AUR, not after a user installs it.
+            if ldd /usr/bin/artemis | tee /work/logs/ldd-output.log | grep -q "not found"; then
+              echo "::error::artemis binary has unresolved shared library dependencies:"
+              grep "not found" /work/logs/ldd-output.log
+              exit 1
+            fi
+
+            echo "=== headless smoke test ==="
+            # artemis uses QCommandLineParser::addVersionOption() (confirmed
+            # in app/cli/commandlineparser.cpp), so --version exits via Qt'"'"'s
+            # own arg-parsing path without needing a real display -- QT_QPA_
+            # PLATFORM=offscreen lets the platform plugin still init cleanly
+            # in a container with no X server. A real crash-on-launch (bad
+            # linkage, corrupt build) fails here instead of at first user
+            # launch.
+            if ! QT_QPA_PLATFORM=offscreen timeout 15 /usr/bin/artemis --version > /work/logs/smoke-test.log 2>&1; then
+              echo "::error::artemis --version failed to run (exit $?), see logs/smoke-test.log"
+              cat /work/logs/smoke-test.log
+              exit 1
+            fi
+
             su builder -c "cd /work && rm -rf src pkg *.pkg.tar.zst *.pkg.tar.zst.sig" || true
             # Undo the chown above — /work is the runner'"'"'s git checkout, and
             # leaving it owned by the in-container builder UID breaks every
@@ -93,6 +179,15 @@ jobs:
             # .git/config since the runner user no longer owns it).
             chown -R "$HOST_UID:$HOST_GID" /work /ccache
           ' 2>&1 | tee logs/full-container-output.log
+
+          # Defense in depth on top of GitHub's own secret-masking: make sure
+          # nothing that looks like key material ended up in a log file this
+          # job is about to upload as a public-repo artifact. Standing rule:
+          # never publish sensitive data.
+          if grep -lE "BEGIN (OPENSSH|RSA|EC) PRIVATE KEY" logs/*.log 2>/dev/null; then
+            echo "::error::A private key marker was found in a build log — refusing to upload. Investigate before this artifact is published."
+            exit 1
+          fi
 
       - name: Save ccache
         if: steps.gate.outputs.cache-hit != 'true' && always()
@@ -131,6 +226,9 @@ jobs:
             logs/full-container-output.log
             logs/build.log
             logs/warnings-summary.log
+            logs/namcap.log
+            logs/ldd-output.log
+            logs/smoke-test.log
             .SRCINFO
           retention-days: 30
           if-no-files-found: warn
@@ -223,6 +321,18 @@ jobs:
           # own failure signatures rather than guessing from the exit code.
           elif [ -f logs/full-container-output.log ] && grep -qE "failed to synchronize|error: failed retrieving file|could not resolve host|error: failed to commit transaction \(conflicting files\)" logs/full-container-output.log; then
             echo "::error::Build-check container failed to install its own dependencies (Arch mirror/network hiccup during pacman -Sy) against upstream ${{ steps.upstream.outputs.sha }} — this is not a PKGBUILD problem. Nothing was pushed to AUR; safe to just re-run."
+          # Post-build validation failures (2026-09-24) each echo their own
+          # ::error:: marker inside the container, captured into the same
+          # log via `tee` -- surface which specific check failed instead of
+          # the generic "PKGBUILD needs a fix" catch-all below.
+          elif [ -f logs/full-container-output.log ] && grep -q "New pkgver .* is OLDER than the live AUR version" logs/full-container-output.log; then
+            echo "::error::pkgver regression guard tripped against upstream ${{ steps.upstream.outputs.sha }} — the newly built pkgver is older than what's live on AUR. This is a real bug (upstream versioning oddity or pkgver() logic), not routine drift. Nothing was pushed to AUR."
+          elif [ -f logs/full-container-output.log ] && grep -q "namcap reported a hard error" logs/full-container-output.log; then
+            echo "::error::namcap found a hard packaging error (E:) against upstream ${{ steps.upstream.outputs.sha }} — see logs/namcap.log in the uploaded artifact. Nothing was pushed to AUR."
+          elif [ -f logs/full-container-output.log ] && grep -q "unresolved shared library dependencies" logs/full-container-output.log; then
+            echo "::error::Built artemis binary has a missing shared library against upstream ${{ steps.upstream.outputs.sha }} — likely a new/changed runtime dep upstream added that PKGBUILD's depends= needs updating for. See logs/ldd-output.log. Nothing was pushed to AUR."
+          elif [ -f logs/full-container-output.log ] && grep -q "artemis --version failed to run" logs/full-container-output.log; then
+            echo "::error::Built artemis binary failed its headless smoke test (--version) against upstream ${{ steps.upstream.outputs.sha }} — it compiled and linked but crashes on launch. See logs/smoke-test.log. Nothing was pushed to AUR."
           else
             echo "::error::Build check failed against upstream ${{ steps.upstream.outputs.sha }} — PKGBUILD likely needs a manual fix (new dep, build-system change). Nothing was pushed to AUR."
           fi
