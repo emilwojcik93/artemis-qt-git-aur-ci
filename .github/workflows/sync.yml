@@ -134,7 +134,16 @@ jobs:
             echo "=== namcap: PKGBUILD ===" > /work/logs/namcap.log
             su builder -c "cd /work && namcap PKGBUILD" >> /work/logs/namcap.log 2>&1 || true
             echo "=== namcap: built package ===" >> /work/logs/namcap.log
-            su builder -c "cd /work && namcap *.pkg.tar.zst" >> /work/logs/namcap.log 2>&1 || true
+            # Explicitly excludes any *-debug-* subpackage: PKGBUILD sets
+            # options=(!debug) to prevent one from being built at all, but
+            # this glob is a second line of defense in case that ever
+            # regresses -- a dbgsym package'"'"'s .build-id symlink is a known
+            # namcap false-positive (E:), not a real packaging bug, and
+            # would otherwise wrongly block every run.
+            for p in *.pkg.tar.zst; do
+              case "$p" in *-debug-*) continue ;; esac
+              su builder -c "cd /work && namcap $p" >> /work/logs/namcap.log 2>&1 || true
+            done
             # namcap warnings are mostly known false positives here (QML
             # modules, transitive libs already covered -- see project notes)
             # so it is informational only; only an `E:` (error, not `W:`
