@@ -150,15 +150,82 @@ Verified with a real full build against these exact patches (not assumed):
 0 errors, 0 warnings, `artemis` binary linked successfully — down from 8
 warnings/0 errors before.
 
+## Post-build validation + run isolation (2026-09-24)
+
+A compile-only check can still let something broken through — history on
+this exact package shows that (the `hicolor-icon-theme` dep and the qmake
+`PREFIX` default were only ever caught by actually building+installing,
+never by reading the PKGBUILD). Added real verify/validate steps inside
+the same container, after `makepkg -s` and before AUR ever sees the
+result:
+
+1. **pkgver regression guard** — `vercmp` the newly built pkgver against
+   AUR's live version (via the AUR RPC API). AUR rejects force-pushes /
+   history rewrites once something's pushed (hit that once already on
+   this package), so this has to be caught *before* pushing, not after.
+2. **namcap** on `PKGBUILD` and the built package — `E:` (hard error) fails
+   the run, `W:` stays informational (this package's `W:`s are known,
+   already-triaged false positives: QML modules and transitive libs namcap
+   can't see are already covered).
+3. **Round-trip install test** — `pacman -U` the freshly built package
+   inside the container, catching file-conflict/post-install-script issues
+   before AUR does.
+4. **`ldd` check** on the installed binary for `not found` — this is the
+   exact failure class that started this whole project
+   (`libavcodec.so.58: cannot open shared object file`); catch it here,
+   not after a user installs it.
+5. **Headless smoke test** — `QT_QPA_PLATFORM=offscreen artemis --version`.
+   Confirmed safe without a real display: `artemis` uses
+   `QCommandLineParser::addVersionOption()`, so this exercises Qt's own
+   platform-plugin init and exits cleanly — catches a crash-on-launch that
+   a clean compile+link wouldn't.
+
+Also added: a `concurrency` group (serializes runs so a slow real build
+can't race a second dispatch over the same cache keys or AUR push), a
+`timeout-minutes` ceiling on the job plus a `timeout` wrap on the `docker
+run` itself (previously unbounded — a wedged container would've idled up
+to GitHub's 6h default), and a grep for private-key markers in every log
+file right before it's uploaded as a (public-repo) artifact — defense in
+depth on top of GitHub's own secret-masking.
+
+**First real dispatch of this immediately found a genuine bug**: the
+container's stock `makepkg.conf` auto-splits an `artemis-qt-git-debug`
+dbgsym subpackage, and namcap correctly-but-unhelpfully flags its
+`.build-id` symlink (points at a path that only exists in the *main*
+package, by design) as a hard `E:` — a known namcap/dbgsym-splitting
+quirk, not a real packaging bug. Fixed at the source with
+`options=('!debug')` in `PKGBUILD` (nobody consumes a separate debug
+package for a `-git` dev build anyway), plus a defense-in-depth skip of
+any `*-debug-*` package in the namcap loop in case that setting ever
+regresses.
+
+**Verified with a real second dispatch after the fix, not assumed**: namcap
+clean (0 `E:`), `ldd` clean (0 `not found`), smoke test printed the real
+`Artemis 0.6.7` version string, pkgver-guard correctly passed on an equal
+version, and the AUR push was real (not a no-op — `PKGBUILD` itself
+changed) — `9124bca..2191cd3` on the AUR git repo.
+
 Also fixed, on the machine running the companion local auto-rebuild
 (pacman hook + systemd service/timer that rebuilds `artemis-qt-git`
 whenever `ffmpeg`/`libplacebo` gets upgraded — separate from this repo's
-CI, see conversation/memory notes): the hook used to fire the rebuild
-service immediately (`--no-block`) from `PostTransaction`, which could run
-concurrently with the *outer* transaction's own tail end. Observed
-concretely: the outer transaction's post-install orphan cleanup
-(`pacman -Rns`) removed `vulkan-headers`/`wayland-protocols` — makedeps the
-concurrent rebuild had just installed — mid-build, failing it. Fixed by
-routing the hook through a 90s-delay `systemd` timer
-(`artemis-qt-git-rebuild.timer`) instead of starting the service directly,
-so the outer transaction (incl. its cleanup) finishes first.
+CI, lives entirely on that machine, not tracked here): the hook used to
+fire the rebuild service immediately (`--no-block`) from
+`PostTransaction`, which could run concurrently with the *outer*
+transaction's own tail end. Observed concretely: the outer transaction's
+post-install orphan cleanup (`pacman -Rns`) removed
+`vulkan-headers`/`wayland-protocols` — makedeps the concurrent rebuild
+had just installed — mid-build, failing it. Fixed 2026-08-27 by routing
+the hook through a 90s-delay `systemd` timer
+(`artemis-qt-git-rebuild.timer`) instead of starting the service directly.
+
+**That fix wasn't sufficient on its own** — recurred 2026-09-23 against a
+combined system+AUR update: the *outer* `paru -Syu` session kept running
+~138s after firing the hook (more AUR packages installing, then its own
+final orphan sweep), past the fixed 90s window, so the same
+makedeps-removed-mid-build failure happened again. Root-caused via
+`/var/log/pacman.log` timestamp correlation, not guessed. Fixed properly
+in `/usr/local/bin/artemis-qt-git-rebuild.sh`: instead of a fixed delay,
+the script now actively polls for a *sustained* absence of any
+`pacman`/`paru` process and the pacman db lock (20s quiet window, 30min
+max-wait fallback) before starting its own build — bounded by however
+long the actual outer transaction takes, not a guess.
