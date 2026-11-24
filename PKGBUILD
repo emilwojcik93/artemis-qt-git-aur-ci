@@ -3,7 +3,7 @@
 _pkgname=artemis
 pkgname=artemis-qt-git
 pkgver=0.6.7.dev.20250831.0017.afe2de7.0.gafe2de7f
-pkgrel=1
+pkgrel=2
 pkgdesc="Enhanced GameStream client for PCs (Artemis Qt, Moonlight fork w/ Apollo/Sunshine extras) - git build"
 arch=('x86_64')
 url="https://github.com/wjbeckett/artemis"
@@ -62,6 +62,17 @@ prepare() {
   cd "$_pkgname"
   git submodule update --init --recursive --depth=1
 
+  # The upstream tree ships checked-in *prebuilt static libraries* that are
+  # actually macOS arm64 Mach-O objects (accidentally committed, not build
+  # products). They are newer than the freshly compiled host objects, so make
+  # happily links them and the final link fails with "undefined reference" to
+  # every Li* / h264_* / qmdns symbol. Delete them so qmake rebuilds each
+  # archive from source for this machine.
+  rm -f moonlight-common-c/libmoonlight-common-c.a \
+        h264bitstream/libh264bitstream.a \
+        qmdnsengine/libqmdnsengine.a \
+        soundio/libsoundio.a
+
   # --- Packaging-level warning fixes (2026-08-27) ---
   # Not applied upstream (wjbeckett/artemis is not ours to push to) — applied
   # here so our AUR build stays warning-clean. Each verified against the real
@@ -116,6 +127,17 @@ prepare() {
     app/streaming/video/ffmpeg-renderers/plvk.cpp
   sed -i 's/^\(\s*\)vkDeviceContext->unlock_queue = unlockQueue;/&\n\1#pragma GCC diagnostic pop/' \
     app/streaming/video/ffmpeg-renderers/plvk.cpp
+
+  # --- OpenSSL 4.x API changes (2026-11-24) ---
+  # Arch's openssl is now 4.1.0, which tightened two APIs this code relied on:
+  #  * X509_get_subject_name() returns const X509_NAME* (was mutable).
+  #  * struct asn1_string_st is opaque, so asnSignature->data/length no longer
+  #    compile; the public ASN1_STRING_get0_data()/ASN1_STRING_length()
+  #    accessors are the supported replacement.
+  sed -i 's/X509_NAME\* name = X509_get_subject_name(cert);/X509_NAME* name = const_cast<X509_NAME*>(X509_get_subject_name(cert));/' \
+    app/backend/identitymanager.cpp
+  sed -i 's/reinterpret_cast<char\*>(asnSignature->data), asnSignature->length/reinterpret_cast<const char*>(ASN1_STRING_get0_data(asnSignature)), ASN1_STRING_length(asnSignature)/g' \
+    app/backend/nvpairingmanager.cpp
 }
 
 build() {
