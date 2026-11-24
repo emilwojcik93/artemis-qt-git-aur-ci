@@ -1,7 +1,7 @@
 pkgbase = artemis-qt-git
 	pkgdesc = Enhanced GameStream client for PCs (Artemis Qt, Moonlight fork w/ Apollo/Sunshine extras) - git build
 	pkgver = 0.6.7.dev.20250831.0017.afe2de7.0.gafe2de7f
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/wjbeckett/artemis
 	arch = x86_64
 	license = GPL-3.0-or-later
